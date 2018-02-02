@@ -146,6 +146,15 @@ func (sg *sesGetter) GetMany(ctx context.Context, keys []*cid.Cid) <-chan *ipld.
 	return getNodesFromBG(ctx, sg.bs, keys)
 }
 
+func NewSession(ctx context.Context, dag ipld.DAGService) ipld.NodeGetter {
+	switch impl := dag.(type) {
+	case *dagService:
+		return &sesGetter{bserv.NewSession(ctx, impl.Blocks)}
+	default:
+		return dag
+	}
+}
+
 // FetchGraph fetches all nodes that are children of the given node
 func FetchGraph(ctx context.Context, root *cid.Cid, serv ipld.DAGService) error {
 	var ng ipld.NodeGetter = serv

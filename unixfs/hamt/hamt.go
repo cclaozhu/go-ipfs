@@ -41,6 +41,8 @@ const (
 	HashMurmur3 uint64 = 0x22
 )
 
+var ErrReadOnly = fmt.Errorf("hamt is in readonly mode")
+
 type HamtShard struct {
 	nd *dag.ProtoNode
 
@@ -57,7 +59,8 @@ type HamtShard struct {
 	prefixPadStr string
 	maxpadlen    int
 
-	dserv ipld.DAGService
+	dserv    ipld.DAGService
+	nodeRead ipld.NodeGetter
 }
 
 // child can either be another shard, or a leaf node value
@@ -68,7 +71,11 @@ type child interface {
 
 // NewHamtShard creates a new, empty HAMT shard with the given size.
 func NewHamtShard(dserv ipld.DAGService, size int) (*HamtShard, error) {
-	ds, err := makeHamtShard(dserv, size)
+	return newHamtShard(dserv, dserv, size)
+}
+
+func newHamtShard(dserv ipld.DAGService, read ipld.NodeGetter, size int) (*HamtShard, error) {
+	ds, err := makeHamtShard(dserv, read, size)
 	if err != nil {
 		return nil, err
 	}
@@ -79,7 +86,7 @@ func NewHamtShard(dserv ipld.DAGService, size int) (*HamtShard, error) {
 	return ds, nil
 }
 
-func makeHamtShard(ds ipld.DAGService, size int) (*HamtShard, error) {
+func makeHamtShard(ds ipld.DAGService, nr ipld.NodeGetter, size int) (*HamtShard, error) {
 	lg2s := int(math.Log2(float64(size)))
 	if 1<<uint(lg2s) != size {
 		return nil, fmt.Errorf("hamt size should be a power of two")
@@ -91,11 +98,20 @@ func makeHamtShard(ds ipld.DAGService, size int) (*HamtShard, error) {
 		maxpadlen:    len(maxpadding),
 		tableSize:    size,
 		dserv:        ds,
+		nodeRead:     nr,
 	}, nil
+}
+
+func NewHamtReader(ng ipld.NodeGetter, nd ipld.Node) (*HamtShard, error) {
+	return newHamtFromDag(nil, ng, nd)
 }
 
 // NewHamtFromDag creates new a HAMT shard from the given DAG.
 func NewHamtFromDag(dserv ipld.DAGService, nd ipld.Node) (*HamtShard, error) {
+	return newHamtFromDag(dserv, dserv, nd)
+}
+
+func newHamtFromDag(write ipld.DAGService, read ipld.NodeGetter, nd ipld.Node) (*HamtShard, error) {
 	pbnd, ok := nd.(*dag.ProtoNode)
 	if !ok {
 		return nil, dag.ErrLinkNotFound
@@ -114,7 +130,7 @@ func NewHamtFromDag(dserv ipld.DAGService, nd ipld.Node) (*HamtShard, error) {
 		return nil, fmt.Errorf("only murmur3 supported as hash function")
 	}
 
-	ds, err := makeHamtShard(dserv, int(pbd.GetFanout()))
+	ds, err := makeHamtShard(write, read, int(pbd.GetFanout()))
 	if err != nil {
 		return nil, err
 	}
@@ -140,6 +156,9 @@ func (ds *HamtShard) Prefix() *cid.Prefix {
 
 // Node serializes the HAMT structure into a merkledag node with unixfs formatting
 func (ds *HamtShard) Node() (ipld.Node, error) {
+	if ds.dserv == nil {
+		return nil, ErrReadOnly
+	}
 	out := new(dag.ProtoNode)
 	out.SetPrefix(ds.prefix)
 
@@ -222,6 +241,10 @@ func (ds *HamtShard) Label() string {
 
 // Set sets 'name' = nd in the HAMT
 func (ds *HamtShard) Set(ctx context.Context, name string, nd ipld.Node) error {
+	if ds.dserv == nil {
+		return ErrReadOnly
+	}
+
 	hv := &hashBits{b: hash([]byte(name))}
 	err := ds.dserv.Add(ctx, nd)
 	if err != nil {
@@ -287,7 +310,7 @@ func (ds *HamtShard) loadChild(ctx context.Context, i int) (child, error) {
 		return nil, fmt.Errorf("invalid link name '%s'", lnk.Name)
 	}
 
-	nd, err := lnk.GetNode(ctx, ds.dserv)
+	nd, err := lnk.GetNode(ctx, ds.nodeRead)
 	if err != nil {
 		return nil, err
 	}
@@ -308,7 +331,7 @@ func (ds *HamtShard) loadChild(ctx context.Context, i int) (child, error) {
 			return nil, fmt.Errorf("HAMT entries must have non-zero length name")
 		}
 
-		cds, err := NewHamtFromDag(ds.dserv, nd)
+		cds, err := newHamtFromDag(ds.dserv, ds.nodeRead, nd)
 		if err != nil {
 			return nil, err
 		}
@@ -332,6 +355,9 @@ func (ds *HamtShard) setChild(i int, c child) {
 
 // Link returns a merklelink to this shard node
 func (ds *HamtShard) Link() (*ipld.Link, error) {
+	if ds.dserv == nil {
+		return nil, ErrReadOnly
+	}
 	nd, err := ds.Node()
 	if err != nil {
 		return nil, err
@@ -453,6 +479,9 @@ func (ds *HamtShard) walkTrie(ctx context.Context, cb func(*shardValue) error) e
 }
 
 func (ds *HamtShard) modifyValue(ctx context.Context, hv *hashBits, key string, val *ipld.Link) error {
+	if ds.dserv == nil {
+		return ErrReadOnly
+	}
 	idx := hv.Next(ds.tableSizeLg2)
 
 	if ds.bitfield.Bit(idx) != 1 {
@@ -510,7 +539,7 @@ func (ds *HamtShard) modifyValue(ctx context.Context, hv *hashBits, key string, 
 		}
 
 		// replace value with another shard, one level deeper
-		ns, err := NewHamtShard(ds.dserv, ds.tableSize)
+		ns, err := newHamtShard(ds.dserv, ds.nodeRead, ds.tableSize)
 		if err != nil {
 			return err
 		}
